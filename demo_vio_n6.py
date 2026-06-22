@@ -42,7 +42,13 @@ def image_stream(imagedir, imagestamp, enable_h5, h5path, calib, stride):
     undist_maps = None      # (m1, m2), computed lazily once we know the frame size
 
     if not enable_h5:
-        image_list = sorted(os.listdir(imagedir))[::stride]
+        # Sort by the integer ns timestamp in the filename, NOT lexicographically.
+        # N6 stamps cross the 10 s boundary (e.g. 3069301000 vs 10026000000), so they
+        # differ in digit count; a string sort interleaves them ("18..." before "3...")
+        # and feeds frames out of time order -- which scrambles them against the
+        # time-ordered IMU and corrupts the VI fusion (and overruns the IMU buffer).
+        image_list = sorted(os.listdir(imagedir),
+                            key=lambda f: int(os.path.splitext(f)[0]))[::stride]
         image_stamps = np.loadtxt(imagestamp,str,delimiter=',')
         image_dict = dict(zip(image_stamps[:,1],image_stamps[:,0]))
         for t, imfile in enumerate(image_list):
@@ -214,8 +220,20 @@ if __name__ == '__main__':
             # so it's used directly with no inversion.
             dbaf.video.Ti1c = np.array(N6CFG['Tbc'])
             dbaf.video.Tbc = gtsam.Pose3(dbaf.video.Ti1c)
-            # imu_params order: [gyro_nd, accel_nd, gyro_rw, accel_rw].
-            dbaf.video.state.set_imu_params(list(N6CFG['imu_params']))
+            # IMU noise: cfg['imu_params'] = [accel_nd, gyro_nd, accel_rw, gyro_rw]
+            # are RAW LSM6DSM datasheet/Allan values (physical sensor noise). DBA-Fusion's
+            # sliding-window optimizer is UNSTABLE fed raw noise -- it diverges into an
+            # accelerating runaway (verified: TUM-VI room1 blows to ~15 km with raw noise,
+            # stays bounded at ~5 m with the upstream inflation below; same on N6). The
+            # inflation absorbs unmodeled error (vibration, scale/misalignment, time-sync
+            # jitter, the linearized preintegration) -- standard VINS practice. Factors are
+            # upstream's (demo_vio_tumvi); the proper N6 values want an Allan-variance run
+            # (calib/allan_variance.py) + a tuned factor. Kept here, not in to_dbaf.py, so
+            # the config stays the physical calibration and this stays estimator tuning.
+            IMU_NOISE_INFLATION = [float(x) for x in
+                os.environ.get("N6_IMU_INFLATE", "25,25,10,5000").split(",")]  # [accel_nd, gyro_nd, accel_rw, gyro_rw]
+            imu_params = [p * f for p, f in zip(N6CFG['imu_params'], IMU_NOISE_INFLATION)]
+            dbaf.video.state.set_imu_params(imu_params)
             dbaf.video.init_pose_sigma = np.array([0.1, 0.1, 0.0001, 0.0001,0.0001,0.0001])
             dbaf.video.init_bias_sigma = np.array([1.0,1.0,1.0, 1.0,1.0,1.0])
             dbaf.frontend.translation_threshold = args.translation_threshold
