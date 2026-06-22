@@ -13,6 +13,34 @@ from math import atan2, cos, sin
 import geoFunc.trans as trans
 from scipy.spatial.transform import Rotation
 
+def gravity_align_R(acc):
+    """World-from-body rotation that maps the measured specific force to world +Z.
+
+    Upstream init_IMU() seeds the first attitude with identity, which only works
+    when the IMU's Z axis is already vertical at startup (the EuRoC mounting):
+    MakeSharedU pins world gravity to body -Z, so identity asserts "Z is up".
+    The N6 rig mounts the IMU with gravity ~along body X at rest, ~90 deg away,
+    and the tight init pose prior (0.1 rad) can't rotate that far -- the
+    uncancelled ~g specific force integrates into a straight-line fly-off.
+
+    Aligning the initial attitude to the static-hold gravity vector fixes this
+    for any mounting. Yaw is unobservable from gravity alone (free choice); the
+    shortest-arc rotation to +Z leaves it at the natural value, and BA + IMU
+    factors refine the residual tilt under the existing prior.
+    """
+    g_b = np.asarray(acc, dtype=float)
+    g_b = g_b / np.linalg.norm(g_b)            # gravity direction in body frame
+    z_w = np.array([0.0, 0.0, 1.0])
+    v = np.cross(g_b, z_w)
+    s = np.linalg.norm(v)
+    c = float(np.dot(g_b, z_w))
+    if s < 1e-8:                               # already (anti)aligned with +Z
+        return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    K = np.array([[0.0, -v[2], v[1]],
+                  [v[2], 0.0, -v[0]],
+                  [-v[1], v[0], 0.0]])
+    return np.eye(3) + K + K @ K * ((1.0 - c) / (s * s))
+
 class DBAFusionFrontend:
     def __init__(self, net, video, args):
         self.video = video
@@ -386,8 +414,16 @@ class DBAFusionFrontend:
         for i in range(self.t0,self.t1):
             tt = self.video.tstamp[i]
             if i == self.t0:
+                # Gravity-align the initial attitude instead of identity (see
+                # gravity_align_R). Average accel over the static-hold window at
+                # the very start of the IMU stream (first 0.5 s) for a clean
+                # gravity estimate, independent of the device's mounting.
+                t_imu0 = self.all_imu[0][0]
+                win = self.all_imu[self.all_imu[:,0] < t_imu0 + 0.5]
+                acc0 = win[:,4:7].mean(axis=0) if len(win) else self.all_imu[0][4:7]
+                R0 = gravity_align_R(acc0)
                 self.video.state.init_first_state(cur_t,np.zeros(3),\
-                                            np.eye(3),\
+                                            R0,\
                                             np.zeros(3))
                 self.video.state.append_imu(self.all_imu[self.cur_imu_ii][0],\
                                         self.all_imu[self.cur_imu_ii][4:7],\
