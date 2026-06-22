@@ -118,8 +118,10 @@ class DBAFusionFrontend:
 
         self.video.last_t0 -= roll
         self.video.last_t1 -= roll
-        self.video.cur_ii  -= roll
-        self.video.cur_jj  -= roll
+        # cur_ii/cur_jj are only set by the IMU bundle adjustment; in visual-only
+        # mode they stay None, so don't shift them when the window rolls up.
+        if self.video.cur_ii is not None: self.video.cur_ii -= roll
+        if self.video.cur_jj is not None: self.video.cur_jj -= roll
         if self.video.imu_enabled:
             graph_temp = gtsam.NonlinearFactorGraph()
             for i in range(self.video.cur_graph.size()):
