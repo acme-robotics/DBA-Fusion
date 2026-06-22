@@ -191,7 +191,7 @@ class DBAFusionFrontend:
         cur_t = float(self.video.tstamp[self.t1-1].detach().cpu())
         self.video.logger.info('predict %f' %cur_t)
 
-        while self.all_imu[self.cur_imu_ii][0] < cur_t:
+        while self.cur_imu_ii < len(self.all_imu) and self.all_imu[self.cur_imu_ii][0] < cur_t:
             ## high-frequency output
             # predict the pose of skipped frames through IMU preintegration
             if self.high_freq_output and self.video.imu_enabled: 
@@ -220,9 +220,10 @@ class DBAFusionFrontend:
                                     self.all_imu[self.cur_imu_ii][4:7],\
                                     self.all_imu[self.cur_imu_ii][1:4]/180*math.pi)
             self.cur_imu_ii += 1
-        self.video.state.append_imu(cur_t,\
-                                    self.all_imu[self.cur_imu_ii][4:7],\
-                                    self.all_imu[self.cur_imu_ii][1:4]/180*math.pi)
+        # at end-of-stream the camera can outrun the last IMU sample; clamp so the
+        # final keyframe still preintegrates up to its image time (vs IndexError).
+        imu_last = self.all_imu[min(self.cur_imu_ii, len(self.all_imu) - 1)]
+        self.video.state.append_imu(cur_t, imu_last[4:7], imu_last[1:4]/180*math.pi)
         self.video.state.append_img(cur_t)
         
         ## append GNSS
