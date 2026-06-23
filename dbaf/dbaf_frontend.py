@@ -6,12 +6,59 @@ from lietorch import SE3, SO3
 from covisible_graph import CovisibleGraph
 import matplotlib.pyplot as plt
 
+import os
 import gtsam
 import math
 import bisect
 from math import atan2, cos, sin
 import geoFunc.trans as trans
 from scipy.spatial.transform import Rotation
+
+# Set N6_DEBUG=1 to trace init / IMU consumption / per-keyframe state. All lines
+# are prefixed "[DBG]" so they're easy to grep out of the tqdm stream.
+DBG = bool(os.environ.get("N6_DEBUG"))
+def dbg(*a):
+    if DBG:
+        print("[DBG]", *a, flush=True)
+
+# N6_IGNORE_LEVER=1 -> force the cam-IMU lever arm to zero in VI init (diagnostic:
+# tests whether the extrinsic translation/baseline is what flips the init scale negative).
+IGNORE_LEVER = bool(os.environ.get("N6_IGNORE_LEVER"))
+# N6_DISABLE_SCALE=1 -> force metric scale s=1.0 at VI init commit (diagnostic: tests
+# whether the committed SCALE is what corrupts the post-commit BA / breaks the attitude,
+# vs the attitude/gravity solve itself). Only meaningful when DROID's visual scale ~= metric.
+DISABLE_SCALE = bool(os.environ.get("N6_DISABLE_SCALE"))
+
+# VI-init quality gate (restores VINS-Mono's LinearAlignment return-false-and-retry that
+# this port had turned into a print-only no-op). Reject an ill-conditioned init -- gravity
+# magnitude far from 9.81 or non-positive scale -- and retry on the next window instead of
+# committing it. N6_INIT_G_TOL: |‖g‖-9.81| tolerance, m/s^2 (VINS uses 1.0). N6_INIT_MAX_DEFER:
+# keyframes past vi_warmup before forcing a best-effort commit (so init can't stall forever).
+N6_INIT_G_TOL = float(os.environ.get("N6_INIT_G_TOL", "1.0"))
+N6_INIT_MAX_DEFER = int(os.environ.get("N6_INIT_MAX_DEFER", "40"))
+# Gyro-bias robustness: the VINS-style solveGyroscopeBias reconciles VISUAL rotation with
+# gyro integration over the init window. On a MOVING start (no still period) that solve
+# absorbs visual-rotation noise into an implausible "bias" (rec7: 0.32 rad/s = 18 deg/s),
+# corrupting the initial attitude. Fix: if the solved |bg| exceeds N6_INIT_BG_MAX (rad/s),
+# fall back to a DIRECT physical estimate -- the mean gyro over the lowest-rotation IMU
+# sub-window (where mean gyro ~= bias). Only trust that seed if the window is actually quiet
+# (gyro std < N6_INIT_QUIET_STD rad/s); else there's no still stretch and we keep the solve.
+N6_INIT_BG_MAX = float(os.environ.get("N6_INIT_BG_MAX", "0.1"))
+N6_INIT_QUIET_STD = float(os.environ.get("N6_INIT_QUIET_STD", "0.1"))
+# Rotation-conditioning gate (root-cause fix): DON'T commit VI init just because the
+# minimum window exists. On a translation-dominated window, DROID's monocular rot-trans
+# ambiguity fabricates relative rotation (tens of deg) that disagrees with the gyro; the
+# IMU-active BA then trades attitude away to reconcile -> km divergence. So defer until the
+# window has (a) enough REAL rotation (sum of preintegrated |dR|) so DROID's rotation is
+# anchored, AND (b) low pre-BA visual-vs-IMU per-edge rotation disagreement (the gyro and the
+# visual relative rotation actually agree). N6_INIT_MIN_ROT: total IMU rotation in window (deg);
+# N6_INIT_MAX_ROTRES: max per-edge |R_vis^-1 R_imu| (deg).
+N6_INIT_MIN_ROT = float(os.environ.get("N6_INIT_MIN_ROT", "8.0"))
+N6_INIT_MAX_ROTRES = float(os.environ.get("N6_INIT_MAX_ROTRES", "5.0"))
+# ...and low pre-BA velocity/position IMU residuals (the visual motion and the IMU
+# actually agree before the BA, not just rotation). N6_INIT_MAX_VELRES: m/s; N6_INIT_MAX_POSRES: m.
+N6_INIT_MAX_VELRES = float(os.environ.get("N6_INIT_MAX_VELRES", "0.3"))
+N6_INIT_MAX_POSRES = float(os.environ.get("N6_INIT_MAX_POSRES", "0.1"))
 
 class DBAFusionFrontend:
     def __init__(self, net, video, args):
@@ -232,6 +279,13 @@ class DBAFusionFrontend:
             q = torch.tensor(Rotation.from_matrix(TTT[:3, :3]).as_quat())
             t = TTT[:3,3]
             self.video.poses[self.t1-1] = torch.cat([t,q])
+            # watch the predicted body state for the blow-out onset
+            p_b = self.video.state.wTbs[-1].translation()
+            v_b = self.video.state.vs[-1]
+            bias = self.video.state.bs[-1]
+            dbg("state t=%.3f |pos|=%.3f |vel|=%.3f ba=%s bg=%s" % (
+                cur_t, float(np.linalg.norm(p_b)), float(np.linalg.norm(v_b)),
+                np.round(bias.accelerometer(), 3), np.round(bias.gyroscope(), 3)))
 
         self.video.logger.info('manage edges')
 
@@ -363,6 +417,8 @@ class DBAFusionFrontend:
                 self.graph.update(None, None, use_inactive=True)
 
         ## try initializing VI/GNSS
+        dbg("update end  t1=%d vi_warmup=%d vi_init_t1=%s imu_enabled=%s cur_imu_ii=%d"
+            % (self.t1, self.vi_warmup, self.video.vi_init_t1, self.video.imu_enabled, self.cur_imu_ii))
         if self.t1 > self.vi_warmup and self.video.vi_init_t1 < 0:
             self.init_VI()
             if not self.visual_only:
@@ -437,8 +493,35 @@ class DBAFusionFrontend:
             if not self.video.imu_enabled:
                 self.video.poses[i] = torch.cat([t,q])
 
+    def _quiet_gyro_bias(self, t_end, win_s=0.5):
+        """Direct gyro-bias estimate = mean gyro over the lowest-rotation IMU sub-window
+        ending at/<= t_end. Returns (bias_rad_s[3], gyro_std_rad_s) for the quietest window,
+        or (None, None) if no IMU. The caller decides whether the window is quiet enough to
+        trust (std < N6_INIT_QUIET_STD). all_imu gyro is deg/s; we return rad/s."""
+        imu = self.all_imu
+        if imu is None or len(imu) < 10:
+            return None, None
+        t_end = float(t_end)
+        t = imu[:, 0]
+        g = imu[:, 1:4] * (math.pi / 180.0)            # deg/s -> rad/s
+        sel = t <= t_end
+        t, g = t[sel], g[sel]
+        if len(t) < 10:
+            return None, None
+        best_std, best_mean = None, None
+        w0 = t[0]
+        while w0 + win_s <= t[-1] + 1e-6:
+            m = (t >= w0) & (t < w0 + win_s)
+            if m.sum() >= 5:
+                std = float(np.linalg.norm(g[m].std(axis=0)))
+                if best_std is None or std < best_std:
+                    best_std, best_mean = std, g[m].mean(axis=0)
+            w0 += win_s / 2.0                          # 50%-overlap slide
+        return best_mean, best_std
+
     def init_VI(self):
         """ initialize the V-I system, referring to VIN-Fusion """
+        dbg("init_VI ENTER  t1=%d visual_only=%s" % (self.t1, self.visual_only))
         sum_g = np.zeros(3,dtype = np.float64)
         ccount = 0
         for i in range(self.t1 - 8 ,self.t1-1):
@@ -453,6 +536,7 @@ class DBAFusionFrontend:
             tmp_g = self.video.state.preintegrations[i].deltaVij()/dt
             var_g += np.linalg.norm(tmp_g - aver_g)**2
         var_g =math.sqrt(var_g/ccount)
+        dbg("init_VI excitation var_g=%.4f (need>=0.25)  aver_g=%s" % (var_g, np.round(aver_g, 3)))
         if var_g < 0.25:
             print("IMU excitation not enough!",var_g)
         else:
@@ -476,12 +560,34 @@ class DBAFusionFrontend:
                 plt.pause(0.1)
 
             if not self.visual_only:
-                self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= True)
+                # Direct gyro-bias seed from the quietest IMU window so far -- only trusted
+                # if that window is actually still (std < N6_INIT_QUIET_STD); else None and
+                # VisualIMUAlignment keeps its own solve.
+                bias_seed, quiet_std = self._quiet_gyro_bias(self.video.tstamp[self.t1-1])
+                if bias_seed is not None and quiet_std is not None and quiet_std < N6_INIT_QUIET_STD:
+                    dbg("quiet-window gyro-bias seed=%s (std=%.4f rad/s)" % (np.round(bias_seed,4), quiet_std))
+                else:
+                    dbg("no quiet-enough window for bias seed (best std=%s) -- keeping solve"
+                        % (None if quiet_std is None else round(quiet_std,4)))
+                    bias_seed = None
+                # Gated first attempt: if the alignment is ill-conditioned (VINS gate),
+                # DON'T commit -- return so init_VI re-fires on the next, better window.
+                # Bounded by N6_INIT_MAX_DEFER so a persistently-poor scene still inits
+                # (best-effort) rather than stalling forever.
+                ok = self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= True, gate= True, bias_prior= bias_seed, disable_scale= DISABLE_SCALE)
+                force = (self.t1 - self.vi_warmup) > N6_INIT_MAX_DEFER
+                if not ok and not force:
+                    dbg("init_VI DEFER (VINS gate failed) -> retry next frame, t1=%d" % self.t1)
+                    return
                 self.graph.update(None, None, use_inactive=True)
-                self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= False)
+                self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= IGNORE_LEVER, bias_prior= bias_seed, disable_scale= DISABLE_SCALE)
                 self.graph.update(None, None, use_inactive=True)
-                self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= False)
+                self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= IGNORE_LEVER, bias_prior= bias_seed, disable_scale= DISABLE_SCALE)
+                if self.video.vi_init_t1 < 0:        # forced commit on a still-poor align
+                    self.video.vi_init_t1 = self.t1
+                    self.video.vi_init_time = self.video.tstamp[self.t1-1]
                 self.video.imu_enabled = True
+                dbg("init_VI DONE -> imu_enabled=True at t1=%d (forced=%s)" % (self.t1, force and not ok))
             else:
                 self.VisualIMUAlignment(self.t1 - 8 ,self.t1, ignore_lever= True)
                 self.graph.update(None, None, use_inactive=True)
@@ -609,7 +715,7 @@ class DBAFusionFrontend:
                 self.graph.update(None, None, use_inactive=True)
             print('GNSS initialized!!!!')
 
-    def VisualIMUAlignment(self, t0, t1, ignore_lever, disable_scale = False):
+    def VisualIMUAlignment(self, t0, t1, ignore_lever, disable_scale = False, gate = False, bias_prior = None):
         poses = SE3(self.video.poses)
         wTcs = poses.inv().matrix().cpu().numpy()
 
@@ -645,6 +751,12 @@ class DBAFusionFrontend:
             A += np.matmul(tmp_A.T,tmp_A)
             b += np.matmul(tmp_A.T,tmp_b)
         bg = -np.matmul(np.linalg.inv(A),b)
+        # If the visual-inertial solve produced an implausible bias (moving-start noise
+        # absorption), override it with the direct quiet-window measurement, if available.
+        if bias_prior is not None and np.linalg.norm(bg) > N6_INIT_BG_MAX:
+            dbg("solveGyroscopeBias |bg|=%.3f > %.3f -> using quiet-window seed %s"
+                % (np.linalg.norm(bg), N6_INIT_BG_MAX, np.round(bias_prior, 4)))
+            bg = np.array(bias_prior, dtype=np.float64)
 
         for i in range(0,t1-1):
             pim = gtsam.PreintegratedCombinedMeasurements(self.video.state.params,\
@@ -771,9 +883,50 @@ class DBAFusionFrontend:
             s = 1.0
             
         print('g,s:',g,s)
+        # VINS gate (restored). On the gated (first) init attempt, reject an ill-
+        # conditioned solution -- gravity magnitude off or non-positive scale -- and
+        # return BEFORE applying it to the state (matches VINS LinearAlignment returning
+        # false ahead of visualInitialAlign). init_VI then retries on the next window.
+        if gate:
+            net_imu_rot = 0.0
+            max_rotres = 0.0
+            max_velres = 0.0
+            max_posres = 0.0
+            _Hg = [np.zeros([15,6],order='F',dtype=np.float64), np.zeros([15,3],order='F',dtype=np.float64),
+                   np.zeros([15,6],order='F',dtype=np.float64), np.zeros([15,3],order='F',dtype=np.float64),
+                   np.zeros([15,6],order='F',dtype=np.float64), np.zeros([15,6],order='F',dtype=np.float64)]
+            bias_g = gtsam.imuBias.ConstantBias(np.zeros(3), bg)
+            for i in range(t0, t1-1):
+                Ri_v = gtsam.Pose3(wTbs[i]).rotation().matrix()
+                Rj_v = gtsam.Pose3(wTbs[i+1]).rotation().matrix()
+                Ri = self.video.state.preintegrations[i].deltaRij().matrix()
+                net_imu_rot += np.degrees(np.arccos(np.clip((np.trace(Ri)-1)/2, -1, 1)))
+                dR = np.matmul(np.matmul(Ri_v.T, Rj_v).T, Ri)
+                max_rotres = max(max_rotres, np.degrees(np.arccos(np.clip((np.trace(dR)-1)/2, -1, 1))))
+                # pre-BA velocity/position residual with the just-solved velocities + scale s
+                Ti = wTbs[i].copy();   Ti[0:3,3] *= s
+                Tj = wTbs[i+1].copy(); Tj[0:3,3] *= s
+                vi = np.matmul(Ri_v, x[(i-t0)*3:(i-t0)*3+3])
+                vj = np.matmul(Rj_v, x[(i+1-t0)*3:(i+1-t0)*3+3])
+                f = gtsam.gtsam.CombinedImuFactor(0,1,2,3,4,5, self.video.state.preintegrations[i])
+                e = f.evaluateErrorCustom(gtsam.Pose3(Ti), vi, gtsam.Pose3(Tj), vj, bias_g, bias_g,
+                                          _Hg[0],_Hg[1],_Hg[2],_Hg[3],_Hg[4],_Hg[5])
+                max_posres = max(max_posres, float(np.linalg.norm(e[3:6])))
+                max_velres = max(max_velres, float(np.linalg.norm(e[6:9])))
+            if (net_imu_rot < N6_INIT_MIN_ROT or max_rotres > N6_INIT_MAX_ROTRES
+                    or max_velres > N6_INIT_MAX_VELRES or max_posres > N6_INIT_MAX_POSRES):
+                dbg("VisualIMUAlignment REJECT (cond gate): net_rot=%.1f°(min%.1f) rotres=%.1f°(max%.1f) velres=%.3f(max%.2f) posres=%.3f(max%.2f)"
+                    % (net_imu_rot, N6_INIT_MIN_ROT, max_rotres, N6_INIT_MAX_ROTRES,
+                       max_velres, N6_INIT_MAX_VELRES, max_posres, N6_INIT_MAX_POSRES))
+                return False
+            dbg("VisualIMUAlignment cond-gate PASS: net_rot=%.1f° rotres=%.1f° velres=%.3f posres=%.3f"
+                % (net_imu_rot, max_rotres, max_velres, max_posres))
+        if gate and not (math.fabs(np.linalg.norm(g) - 9.81) <= N6_INIT_G_TOL and s > 0):
+            dbg("VisualIMUAlignment REJECT (VINS gate): |g|=%.3f s=%.4f" % (np.linalg.norm(g), s))
+            return False
         if math.fabs(np.linalg.norm(g) - 9.81) < 0.5 and s > 0:
             print('V-I successfully initialized!')
-        
+
         # visualInitialAlign
         wTbs[:,0:3,3] *= s # !!!!!!!!!!!!!!!!!!!!!!!!
         for i in range(0, t1-t0):
@@ -818,12 +971,22 @@ class DBAFusionFrontend:
             t = torch.tensor(TTT[:3,3])
             self.video.poses[i] = torch.cat([t,q])
             self.video.disps[i] /= s
+        if DBG:
+            # COMMIT-TIME attitude audit: estimator's gravity dir in each body frame
+            # (committed, gravity-aligned world g=-z) -> compare offline to accel.
+            wg = np.array([0.0, 0.0, -1.0])
+            for i in range(t0, t1):
+                gb = np.matmul(wTbs[i,0:3,0:3].T, wg)
+                dbg("COMMIT_ATT i=%d t=%.6f s=%.4f gdir_body_est=%s" % (
+                    i, float(self.video.tstamp[i]), s, np.round(gb, 4)))
+        return True
 
     def __initialize(self):
         """ initialize the SLAM system """
 
         self.t0 = 0
         self.t1 = self.video.counter.value
+        dbg("__initialize  t1(counter)=%d warmup=%d" % (self.t1, self.warmup))
 
         self.graph.add_neighborhood_factors(self.t0, self.t1, r=3)
 

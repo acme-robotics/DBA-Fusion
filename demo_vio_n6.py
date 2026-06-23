@@ -16,6 +16,12 @@ import math
 import quaternion
 import gtsam
 
+# N6_DEBUG=1 -> trace config / IMU loading / inflation (prefix "[DBG]" for grepping).
+DBG = bool(os.environ.get("N6_DEBUG"))
+def dbg(*a):
+    if DBG:
+        print("[DBG]", *a, flush=True)
+
 def show_image(image):
     image = image.permute(1, 2, 0).cpu().numpy()
     cv2.imshow('image', image / 255.0)
@@ -136,12 +142,13 @@ if __name__ == '__main__':
     parser.add_argument("--n6_config", type=str, required=True,
                         help="DBA-Fusion config JSON built by calib/to_dbaf.py from the "
                              "Kalibr calibration (Tbc extrinsic, imu_params, timeshift)")
-    parser.add_argument("--apply_timeshift", action="store_true",
-                        help="apply the Kalibr cam-IMU timeshift from the config. OFF by "
-                             "default: it's a sub-frame refinement, and on this rig it's "
-                             "the same magnitude as the natural IMU-lead margin, so a naive "
-                             "shift can flip IMU to lagging (DBA-Fusion forbids that). The "
-                             "shared-clock recording is already drift-free aligned.")
+    parser.add_argument("--apply_timeshift", action=argparse.BooleanOptionalAction, default=False,
+                        help="apply the Kalibr cam-IMU timeshift (IMU.TimeShift) from the config: "
+                             "all_imu_t -= timeshift_s. OFF by default: empirically it made the "
+                             "working still-start case worse (2.6 m -> 12 m), and the magnitude is "
+                             "unresolved (cross-corr says ~8-14 ms vs Kalibr's 3.7 ms). The sign is "
+                             "correct (negative); validate the magnitude with the sync tooling before "
+                             "trusting it.")
 
     args = parser.parse_args()
     args.skip_edge = eval(args.skip_edge)
@@ -185,12 +192,24 @@ if __name__ == '__main__':
     all_imu = np.loadtxt(args.imupath,delimiter=',')
     all_imu[:,0] /= 1e9
     all_imu[:,1:4] *= 180/math.pi
-    # Kalibr cam-IMU time offset (t_imu = t_cam + timeshift): map IMU stamps onto the
-    # camera timeline. Opt-in (--apply_timeshift): it's a sub-frame refinement on top of
-    # the already drift-free shared-clock alignment, and naive application can flip IMU
-    # into lagging the camera (which DBA-Fusion's append_imu rejects).
+    dbg("IMU loaded: %d samples  t=[%.3f..%.3f]  dt~%.4f (%.1f Hz)  monotonic=%s" % (
+        len(all_imu), all_imu[0,0], all_imu[-1,0],
+        np.median(np.diff(all_imu[:,0])), 1.0/np.median(np.diff(all_imu[:,0])),
+        bool(np.all(np.diff(all_imu[:,0]) > 0))))
+    # Kalibr cam-IMU time offset (t_imu = t_cam + timeshift): put IMU stamps on the
+    # camera clock via t_cam = t_imu - timeshift (so a negative timeshift_s ADVANCES the
+    # IMU stamps). This is independent of, and composes with, the mid-exposure shift
+    # n6_to_euroc already applied to the *camera* stamps -- no double count. OFF by default
+    # (pass --apply_timeshift); the magnitude is config-driven from the Kalibr calib
+    # (imu16: -5.43 ms). A sub-frame correction -- it does NOT fix the init scale
+    # degeneracy (that's the extrinsic lever arm), but it's the correct calibration.
+    ts = N6CFG.get('timeshift_s', 0.0)
     if args.apply_timeshift:
-        all_imu[:,0] -= N6CFG.get('timeshift_s', 0.0)
+        all_imu[:,0] -= ts
+        dbg("timeshift APPLIED: %.6f s (%.3f ms); IMU t now [%.3f..%.3f]" % (
+            ts, ts * 1e3, all_imu[0,0], all_imu[-1,0]))
+    else:
+        dbg("timeshift NOT applied (--apply_timeshift off); config ts=%.6f s" % ts)
 
     tstamps = []
 
@@ -233,6 +252,9 @@ if __name__ == '__main__':
             IMU_NOISE_INFLATION = [float(x) for x in
                 os.environ.get("N6_IMU_INFLATE", "25,25,10,5000").split(",")]  # [accel_nd, gyro_nd, accel_rw, gyro_rw]
             imu_params = [p * f for p, f in zip(N6CFG['imu_params'], IMU_NOISE_INFLATION)]
+            dbg("imu_params base=%s  inflate=%s  final=%s" % (
+                N6CFG['imu_params'], IMU_NOISE_INFLATION, [float('%.3g' % x) for x in imu_params]))
+            dbg("Tbc=\n%s" % np.round(np.array(N6CFG['Tbc']), 4))
             dbaf.video.state.set_imu_params(imu_params)
             dbaf.video.init_pose_sigma = np.array([0.1, 0.1, 0.0001, 0.0001,0.0001,0.0001])
             dbaf.video.init_bias_sigma = np.array([1.0,1.0,1.0, 1.0,1.0,1.0])

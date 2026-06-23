@@ -13,6 +13,7 @@ import gtsam
 from gtsam.symbol_shorthand import B, V, X
 from scipy.spatial.transform import Rotation
 import copy
+import os
 import logging
 import geoFunc.trans as trans
 from lietorch import SE3
@@ -543,6 +544,41 @@ class DepthVideo:
 
                     optimizer = gtsam.LevenbergMarquardtOptimizer(self.cur_graph, initial, params)
                     self.cur_result = optimizer.optimize()
+
+                    # --- N6_DEBUG: dump the first few IMU-active BA solves (crime-scene audit) ---
+                    if os.environ.get("N6_DEBUG") and (not self.ignore_imu) and iter == 0 and getattr(self, "_imuba_n", 0) < 3:
+                        self._imuba_n = getattr(self, "_imuba_n", 0) + 1
+                        _H = [np.zeros([15,6],order='F',dtype=np.float64), np.zeros([15,3],order='F',dtype=np.float64),
+                              np.zeros([15,6],order='F',dtype=np.float64), np.zeros([15,3],order='F',dtype=np.float64),
+                              np.zeros([15,6],order='F',dtype=np.float64), np.zeros([15,6],order='F',dtype=np.float64)]
+                        for i in range(t0 + 1, min(t0 + 5, t1)):
+                            try:
+                                f = gtsam.gtsam.CombinedImuFactor(X(i-1), V(i-1), X(i), V(i), B(i-1), B(i),
+                                                                  self.state.preintegrations[i-1])
+                                e = f.evaluateErrorCustom(initial.atPose3(X(i-1)), initial.atVector(V(i-1)),
+                                                          initial.atPose3(X(i)), initial.atVector(V(i)),
+                                                          initial.atConstantBias(B(i-1)), initial.atConstantBias(B(i)),
+                                                          _H[0],_H[1],_H[2],_H[3],_H[4],_H[5])
+                                # DIRECT visual-vs-imu relative-rotation disagreement (pre-BA)
+                                Rvis = np.matmul(initial.atPose3(X(i-1)).rotation().matrix().T,
+                                                 initial.atPose3(X(i)).rotation().matrix())
+                                Rimu = self.state.preintegrations[i-1].deltaRij().matrix()
+                                dR = np.matmul(Rvis.T, Rimu)
+                                vva = float(np.degrees(np.arccos(np.clip((np.trace(dR)-1)/2, -1, 1))))
+                                dtij = self.state.preintegrations[i-1].deltaTij()
+                                print("[DBG] IMUBA#%d edge %d->%d  visVSimu_rot=%.1fdeg  |Rvis|=%.1f |Rimu|=%.1f dt=%.3f  res rot=%.3f pos=%.3f vel=%.3f" % (
+                                    self._imuba_n, i-1, i, vva,
+                                    float(np.degrees(np.arccos(np.clip((np.trace(Rvis)-1)/2,-1,1)))),
+                                    float(np.degrees(np.arccos(np.clip((np.trace(Rimu)-1)/2,-1,1)))), float(dtij),
+                                    float(np.linalg.norm(e[0:3])), float(np.linalg.norm(e[3:6])), float(np.linalg.norm(e[6:9]))), flush=True)
+                            except Exception as ex:
+                                print("[DBG] IMUBA res-err:", repr(ex), flush=True)
+                        for i in range(t0, t1):
+                            xi = gtsam.Pose3.Logmap(initial.atPose3(X(i)).inverse() * self.cur_result.atPose3(X(i)))
+                            bg = self.cur_result.atConstantBias(B(i)).gyroscope()
+                            print("[DBG] IMUBA#%d frame %d d_rot=%.1fdeg d_trans=%.3fm |bg|=%.4f" % (
+                                self._imuba_n, i, float(np.degrees(np.linalg.norm(xi[0:3]))),
+                                float(np.linalg.norm(xi[3:6])), float(np.linalg.norm(bg))), flush=True)
 
                     # retraction and depth update
                     for i in range(t0,t1):
